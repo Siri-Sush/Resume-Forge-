@@ -1,17 +1,56 @@
 /* ================================================================
    Resume Forge — app.js
-   Handles: step nav, API calls, resume rendering,
-            ATS suggestions, inline editing, AI rewrite
+   Powered by Google Gemini API (Free)
+   Key is entered by the user in the browser — never in the code.
 ================================================================ */
+
+function getGeminiUrl() {
+  const key = sessionStorage.getItem('rf_gemini_key');
+  return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`;
+}
 
 // ── State ───────────────────────────────────────────────────────
 const STATE = {
   jd: '',
   skills: '',
-  resumeSections: [],   // [{id, label, text, html}]
+  resumeSections: [],
   activeEditId: null,
   aiSuggestion: null,
 };
+
+// ── On page load ────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  if (!sessionStorage.getItem('rf_gemini_key')) {
+    show('keySetupCard', true);
+    show('jdCard', false);
+    show('stepsBar', false);
+  } else {
+    show('keySetupCard', false);
+    show('jdCard', true);
+    show('stepsBar', true);
+  }
+});
+
+// ── Key setup ───────────────────────────────────────────────────
+function saveApiKey() {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  if (!key || key.length < 10) { flash('apiKeyInput'); return; }
+  sessionStorage.setItem('rf_gemini_key', key);
+  show('keySetupCard', false);
+  show('jdCard', true);
+  show('stepsBar', true);
+}
+
+function changeKey() {
+  sessionStorage.removeItem('rf_gemini_key');
+  show('outputSection', false);
+  show('skillsCard', false);
+  show('jdCard', false);
+  show('stepsBar', false);
+  show('keySetupCard', true);
+  document.getElementById('apiKeyInput').value = '';
+  updateSteps(1);
+}
 
 // ── Loading messages ────────────────────────────────────────────
 const LOADING_MSGS = [
@@ -31,7 +70,8 @@ function goToStep2() {
   const jd = document.getElementById('jdInput').value.trim();
   if (!jd || jd.length < 50) { flash('jdInput'); return; }
   STATE.jd = jd;
-  show('jdCard', false); show('skillsCard', true);
+  show('jdCard', false);
+  show('skillsCard', true);
   updateSteps(2);
   scrollTop();
 }
@@ -83,19 +123,15 @@ async function generateResume() {
   if (!skills || skills.length < 30) { flash('skillsInput'); return; }
   STATE.skills = skills;
 
-  const errEl = document.getElementById('errorMsg');
-  errEl.style.display = 'none';
-
+  show('errorMsg', false);
   showLoading();
   updateSteps(3);
 
   const prompt = buildPrompt(STATE.jd, STATE.skills);
 
   try {
-    const data = await callClaude(prompt, 2000);
-    const fullText = data.content.map(b => b.text || '').join('');
-
-    const [resumePart, atsPart] = fullText.split('---ATS_DATA---');
+    const text = await callGemini(prompt, 2000);
+    const [resumePart, atsPart] = text.split('---ATS_DATA---');
 
     const score   = parseField(atsPart, 'SCORE',   '75');
     const verdict = parseField(atsPart, 'VERDICT', 'Good Match');
@@ -131,15 +167,15 @@ INSTRUCTIONS:
 2. Sound like a real person wrote it. NEVER use: "results-driven", "dynamic", "synergy", "leverage", "passionate", "spearheaded" (unless natural), "proven track record".
 3. Use specific language. Include estimated metrics where possible.
 4. Embed job description keywords naturally.
-5. Structure: [Full Name] → contact line (use placeholders like [your.email@email.com] · [City] · [Phone]) → PROFESSIONAL SUMMARY (3-4 sharp sentences) → WORK EXPERIENCE (company | title | dates, then 3-5 bullet points each starting with a strong verb) → SKILLS → EDUCATION
-6. Keep to ~500 words of body content.
+5. Structure: [Full Name] then contact line (use placeholders like [your.email@email.com] and [City] and [Phone]) then PROFESSIONAL SUMMARY (3-4 sharp sentences) then WORK EXPERIENCE (company | title | dates, then 3-5 bullet points each starting with a strong verb) then SKILLS then EDUCATION
+6. Keep to around 500 words of body content.
 
 After the resume write exactly on a new line:
 ---ATS_DATA---
 SCORE:[number 55-97]
 VERDICT:[Strong Match OR Good Match OR Moderate Match]
 DETAIL:[2-3 sentences mentioning 2-3 specific matched keywords]
-SUG1:[FORMAT: impact_level|title|description|points — e.g. high|Add missing keyword "agile methodology"|The JD mentions this 3 times but it's absent from your resume. Add it naturally to summary or experience.|8]
+SUG1:[FORMAT: impact_level|title|description|points example: high|Add missing keyword agile methodology|The JD mentions this 3 times but it is absent from your resume. Add it naturally to summary or experience.|8]
 SUG2:[same format as SUG1]
 SUG3:[same format as SUG1]
 
@@ -148,7 +184,6 @@ Write the resume now:`;
 
 // ── Render Output ───────────────────────────────────────────────
 function renderOutput(resumeText, score, verdict, detail, suggestions) {
-  // ATS score
   document.getElementById('atsScoreDisplay').innerHTML = score + '<span>/100</span>';
   document.getElementById('atsVerdict').textContent = verdict;
   document.getElementById('atsDetail').textContent  = detail;
@@ -158,10 +193,7 @@ function renderOutput(resumeText, score, verdict, detail, suggestions) {
 
   setTimeout(() => { document.getElementById('atsFill').style.width = score + '%'; }, 300);
 
-  // ATS Suggestions
   renderSuggestions(suggestions);
-
-  // Resume
   parseAndRenderResume(resumeText);
 
   show('outputSection', true);
@@ -173,15 +205,17 @@ function renderSuggestions(suggestions) {
   if (!suggestions.length) return;
 
   let totalPts = 0;
-  const icons = { high: '⚠', med: '◈', low: '✓' };
+  const icons  = { high: '⚠', med: '◈', low: '✓' };
   const labels = { high: 'High impact', med: 'Medium impact', low: 'Low effort' };
 
   let html = '';
   suggestions.forEach(s => {
-    const [level, title, desc, pts] = s.split('|');
-    const lvl = level.trim().toLowerCase();
-    const ptNum = parseInt(pts) || 5;
-    totalPts += ptNum;
+    const parts = s.split('|');
+    const lvl   = (parts[0] || 'med').trim().toLowerCase();
+    const title = parts[1] || '';
+    const desc  = parts[2] || '';
+    const ptNum = parseInt(parts[3]) || 5;
+    totalPts   += ptNum;
     html += `
       <div class="suggestion-item ${lvl}">
         <div class="sug-icon ${lvl}">${icons[lvl] || '◈'}</div>
@@ -211,29 +245,24 @@ function parseAndRenderResume(text) {
     const t = line.trim();
     if (!t) continue;
 
-    // Name (first non-empty line)
     if (!nameFound) {
       sections.push({ id: 'name', label: 'Name', text: t, type: 'name' });
       nameFound = true;
       continue;
     }
 
-    // Contact line (has @ or | or brackets, early in doc)
     if (!currentSection && (t.includes('@') || t.includes('·') || t.includes('|'))) {
       sections.push({ id: 'contact', label: 'Contact', text: t, type: 'contact' });
       continue;
     }
 
-    // Section header (ALL CAPS, short)
     if (t === t.toUpperCase() && t.length > 3 && t.length < 50 && /[A-Z]{3}/.test(t)) {
       currentSection = { id: 'sec_' + sections.length, label: titleCase(t), text: '', type: 'section', header: t, blocks: [] };
       sections.push(currentSection);
       continue;
     }
 
-    // Content within section
     if (currentSection) {
-      currentSection.blocks = currentSection.blocks || [];
       currentSection.blocks.push(t);
       currentSection.text = currentSection.blocks.join('\n');
     }
@@ -267,7 +296,6 @@ function renderSectionContent(blocks) {
     const t = line.trim();
     if (!t) return;
 
-    // Bullet point
     if (t.startsWith('•') || t.startsWith('-') || t.startsWith('*')) {
       if (!inList) { html += '<ul>'; inList = true; }
       html += `<li>${escHtml(t.replace(/^[•\-\*]\s*/, ''))}</li>`;
@@ -276,15 +304,8 @@ function renderSectionContent(blocks) {
 
     if (inList) { html += '</ul>'; inList = false; }
 
-    // Job header line (contains a year OR has | separator)
     if (/\d{4}/.test(t) && t.length < 90) {
       html += `<div class="r-job-header">${escHtml(t)}</div>`;
-      return;
-    }
-
-    // Date-only line
-    if (/^\d{4}/.test(t) || /present/i.test(t)) {
-      html += `<div class="r-job-date">${escHtml(t)}</div>`;
       return;
     }
 
@@ -334,14 +355,11 @@ function closeModalOnOverlay(e) {
 function saveEdit() {
   const id = STATE.activeEditId;
   if (!id) return;
-
   const newText = document.getElementById('modalTextarea').value.trim();
   const sec = STATE.resumeSections.find(s => s.id === id);
   if (!sec) return;
-
   sec.text = newText;
   if (sec.blocks) sec.blocks = newText.split('\n');
-
   renderResumeHTML();
   closeEditModal();
 }
@@ -360,12 +378,12 @@ function dismissAiSuggestion() {
 
 // ── AI Rewrite ──────────────────────────────────────────────────
 async function requestAiRewrite() {
-  const id = STATE.activeEditId;
+  const id  = STATE.activeEditId;
   const sec = STATE.resumeSections.find(s => s.id === id);
   if (!sec) return;
 
   const currentText = document.getElementById('modalTextarea').value.trim();
-  const btn = document.getElementById('aiRewriteBtn');
+  const btn   = document.getElementById('aiRewriteBtn');
   const errEl = document.getElementById('modalError');
   errEl.style.display = 'none';
 
@@ -390,13 +408,10 @@ INSTRUCTIONS:
 - Return ONLY the rewritten text, no explanation or preamble`;
 
   try {
-    const data = await callClaude(prompt, 600);
-    const suggestion = data.content.map(b => b.text || '').join('').trim();
-
-    STATE.aiSuggestion = suggestion;
-    document.getElementById('modalAiText').textContent = suggestion;
+    const suggestion = await callGemini(prompt, 600);
+    STATE.aiSuggestion = suggestion.trim();
+    document.getElementById('modalAiText').textContent = STATE.aiSuggestion;
     document.getElementById('modalAiWrap').style.display = 'block';
-
   } catch (err) {
     showError('modalError', 'AI rewrite failed: ' + (err.message || 'Try again.'));
   } finally {
@@ -410,24 +425,41 @@ function copyResume() {
   const text = document.getElementById('resumeOutput').innerText;
   navigator.clipboard.writeText(text).then(() => {
     const btns = document.querySelectorAll('.btn-secondary');
-    btns.forEach(b => { if (b.textContent.includes('Copy')) { b.textContent = '✓ Copied!'; setTimeout(() => b.textContent = '⧉ Copy Resume', 2000); } });
+    btns.forEach(b => {
+      if (b.textContent.includes('Copy')) {
+        b.textContent = '✓ Copied!';
+        setTimeout(() => b.textContent = '⧉ Copy Resume', 2000);
+      }
+    });
   });
 }
 
-// ── Claude API helper ────────────────────────────────────────────
-async function callClaude(prompt, maxTokens = 1000) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+// ── Gemini API helper ────────────────────────────────────────────
+async function callGemini(prompt, maxTokens = 1000) {
+  const url = getGeminiUrl();
+  const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: maxTokens,
-      messages: [{ role: 'user', content: prompt }],
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 }
     }),
   });
+
   const data = await response.json();
-  if (!response.ok || !data.content) throw new Error(data.error?.message || 'API request failed');
-  return data;
+
+  if (!response.ok) {
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      sessionStorage.removeItem('rf_gemini_key');
+      changeKey();
+      throw new Error('Invalid API key. Please re-enter your Gemini key.');
+    }
+    throw new Error(data.error?.message || 'Gemini API request failed');
+  }
+
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('No response from Gemini');
+  return text;
 }
 
 // ── Utilities ────────────────────────────────────────────────────
@@ -473,7 +505,6 @@ function scrollTop() {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-// ── Keyboard shortcut: Escape closes modal ───────────────────────
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeEditModal();
 });
